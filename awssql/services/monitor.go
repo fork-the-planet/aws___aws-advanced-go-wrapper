@@ -17,10 +17,12 @@
 package services
 
 import (
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-advanced-go-wrapper/awssql/v2/driver_infrastructure"
+	"github.com/aws/aws-advanced-go-wrapper/awssql/v2/error_util"
 	"github.com/aws/aws-advanced-go-wrapper/awssql/v2/utils"
 )
 
@@ -46,11 +48,110 @@ type monitorItem struct {
 	expiresAt       atomic.Int64 // unix nano timestamp
 }
 
+type monitorInitialization struct {
+	done    chan struct{}
+	monitor driver_infrastructure.Monitor
+	err     error
+}
+
 // cacheContainer holds a cache of monitors with related settings.
 type cacheContainer struct {
-	settings         *driver_infrastructure.MonitorSettings
-	cache            *utils.RWMap[any, *monitorItem]
-	producedDataType string // The type key of data produced by this monitor type
+	settings               *driver_infrastructure.MonitorSettings
+	cache                  *utils.RWMap[any, *monitorItem]
+	producedDataType       string // The type key of data produced by this monitor type
+	initializationLock     sync.Mutex
+	monitorInitializations map[any]*monitorInitialization
+}
+
+// getAndExtendExpiration returns the cached monitor for key, extending its
+// expiration, or false if no monitor is cached.
+func (c *cacheContainer) getAndExtendExpiration(key any) (driver_infrastructure.Monitor, bool) {
+	item, exists := c.cache.Get(key)
+	if !exists || item == nil {
+		return nil, false
+	}
+	item.expiresAt.Store(time.Now().Add(c.settings.ExpirationTimeout).UnixNano())
+	return item.monitor, true
+}
+
+// runIfAbsent returns the cached monitor for key, coalescing concurrent
+// initialization so that exactly one caller invokes monitorSupplier while
+// concurrent same-key callers wait for and share its result. A failed
+// initialization is not cached, so a later call can retry.
+func (c *cacheContainer) runIfAbsent(
+	key any,
+	monitorSupplier func() (driver_infrastructure.Monitor, error),
+) (driver_infrastructure.Monitor, error) {
+	// Cache hits stay off initializationLock so they don't serialize; some
+	// callers look up their monitor on every network-bound method call.
+	if monitor, exists := c.getAndExtendExpiration(key); exists {
+		return monitor, nil
+	}
+
+	c.initializationLock.Lock()
+	// Re-check under the lock: an initialization that completed after the
+	// lock-free read would otherwise be duplicated.
+	if monitor, exists := c.getAndExtendExpiration(key); exists {
+		c.initializationLock.Unlock()
+		return monitor, nil
+	}
+
+	if initialization, exists := c.monitorInitializations[key]; exists {
+		c.initializationLock.Unlock()
+		<-initialization.done
+		return initialization.monitor, initialization.err
+	}
+
+	initialization := &monitorInitialization{done: make(chan struct{})}
+	c.monitorInitializations[key] = initialization
+	c.initializationLock.Unlock()
+
+	return c.initializeMonitor(key, initialization, monitorSupplier)
+}
+
+// initializeMonitor invokes monitorSupplier and publishes the result to
+// same-key callers waiting on initialization. Publication runs in a defer so
+// that a panicking supplier still unblocks waiters with an error and clears
+// the in-flight entry; otherwise every later same-key call would block
+// forever. The panic itself continues to propagate to this caller.
+func (c *cacheContainer) initializeMonitor(
+	key any,
+	initialization *monitorInitialization,
+	monitorSupplier func() (driver_infrastructure.Monitor, error),
+) (monitor driver_infrastructure.Monitor, err error) {
+	completed := false
+	defer func() {
+		if !completed {
+			monitor = nil
+			err = error_util.NewGenericAwsWrapperError(error_util.GetMessage("MonitorManager.initializationPanicked"))
+		}
+
+		c.initializationLock.Lock()
+		defer c.initializationLock.Unlock()
+
+		initialization.monitor = monitor
+		initialization.err = err
+		delete(c.monitorInitializations, key)
+		// done is closed via defer so waiters are unblocked even if Start panics.
+		defer close(initialization.done)
+
+		if err == nil {
+			item := &monitorItem{
+				monitor:         monitor,
+				monitorSupplier: monitorSupplier,
+			}
+			item.expiresAt.Store(time.Now().Add(c.settings.ExpirationTimeout).UnixNano())
+
+			// Cache insertion and Start stay under initializationLock so the
+			// cleanup loop cannot dispose a monitor that has not started yet.
+			c.cache.Put(key, item)
+			monitor.Start()
+		}
+	}()
+
+	monitor, err = monitorSupplier()
+	completed = true
+	return monitor, err
 }
 
 // MonitorManager manages background monitors with expiration and health checks.
@@ -118,9 +219,10 @@ func (m *MonitorManager) RegisterMonitorType(
 	producedDataType string,
 ) {
 	m.monitorCaches.PutIfAbsent(monitorType.Name, &cacheContainer{
-		settings:         settings,
-		cache:            utils.NewRWMap[any, *monitorItem](),
-		producedDataType: producedDataType,
+		settings:               settings,
+		cache:                  utils.NewRWMap[any, *monitorItem](),
+		producedDataType:       producedDataType,
+		monitorInitializations: make(map[any]*monitorInitialization),
 	})
 }
 
@@ -138,34 +240,10 @@ func (m *MonitorManager) RunIfAbsent(
 		cacheContainer, _ = m.monitorCaches.Get(monitorType.Name)
 	}
 
-	// Check if monitor already exists
-	existingItem, exists := cacheContainer.cache.Get(key)
-	if exists && existingItem != nil {
-		// Extend expiration
-		existingItem.expiresAt.Store(time.Now().Add(cacheContainer.settings.ExpirationTimeout).UnixNano())
-		return existingItem.monitor, nil
-	}
-
-	// Create new monitor
 	monitorSupplier := func() (driver_infrastructure.Monitor, error) {
 		return initializer(container)
 	}
-
-	monitor, err := monitorSupplier()
-	if err != nil {
-		return nil, err
-	}
-
-	item := &monitorItem{
-		monitor:         monitor,
-		monitorSupplier: monitorSupplier,
-	}
-	item.expiresAt.Store(time.Now().Add(cacheContainer.settings.ExpirationTimeout).UnixNano())
-
-	cacheContainer.cache.PutIfAbsent(key, item)
-	monitor.Start()
-
-	return monitor, nil
+	return cacheContainer.runIfAbsent(key, monitorSupplier)
 }
 
 // Get retrieves a monitor by type and key.
@@ -266,6 +344,8 @@ func (m *MonitorManager) checkMonitors() {
 	m.monitorCaches.ForEach(func(_ string, container *cacheContainer) {
 		settings := container.settings
 
+		container.initializationLock.Lock()
+
 		// Remove and stop monitors that are stopped or expired
 		stopped := container.cache.RemoveIf(func(_ any, item *monitorItem) bool {
 			if item == nil {
@@ -276,9 +356,6 @@ func (m *MonitorManager) checkMonitors() {
 			}
 			return now.After(time.Unix(0, item.expiresAt.Load())) && item.monitor.CanDispose()
 		})
-		for _, entry := range stopped {
-			entry.Value.monitor.Stop()
-		}
 
 		// Remove and handle monitors in error state or stuck
 		errored := container.cache.RemoveIf(func(_ any, item *monitorItem) bool {
@@ -291,6 +368,12 @@ func (m *MonitorManager) checkMonitors() {
 			lastActivity := time.Unix(0, item.monitor.GetLastActivityTimestampNanos())
 			return now.Sub(lastActivity) > settings.InactiveTimeout
 		})
+
+		container.initializationLock.Unlock()
+
+		for _, entry := range stopped {
+			entry.Value.monitor.Stop()
+		}
 		for _, entry := range errored {
 			m.handleMonitorError(container, entry.Key, entry.Value)
 		}
@@ -302,19 +385,6 @@ func (m *MonitorManager) handleMonitorError(container *cacheContainer, key any, 
 
 	// Check if we should recreate the monitor
 	if container.settings.ErrorResponses[driver_infrastructure.MonitorErrorRecreate] {
-		// Try to recreate the monitor
-		newMonitor, err := errorItem.monitorSupplier()
-		if err != nil {
-			return
-		}
-
-		newItem := &monitorItem{
-			monitor:         newMonitor,
-			monitorSupplier: errorItem.monitorSupplier,
-		}
-		newItem.expiresAt.Store(time.Now().Add(container.settings.ExpirationTimeout).UnixNano())
-
-		container.cache.PutIfAbsent(key, newItem)
-		newMonitor.Start()
+		_, _ = container.runIfAbsent(key, errorItem.monitorSupplier)
 	}
 }
